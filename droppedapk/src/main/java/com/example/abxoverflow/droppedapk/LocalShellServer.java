@@ -96,6 +96,7 @@ public final class LocalShellServer extends Thread {
         private volatile OutputStream mForegroundStdin;
         private volatile Thread mPumpThread;
         private volatile boolean mRunning = true;
+        private volatile boolean mOneshot;
         private volatile boolean mExecKilled;
         private String[] mExecArgv = new String[0];
 
@@ -113,10 +114,14 @@ public final class LocalShellServer extends Thread {
         void run() throws Exception {
             printBanner();
             sendPrompt();
-            while (mRunning) {
-                int b = readFilteredByte();
-                if (b < 0) break;
-                handleInputByte((byte) b);
+            try {
+                while (mRunning) {
+                    int b = readFilteredByte();
+                    if (b < 0) break;
+                    handleInputByte((byte) b);
+                }
+            } catch (IOException e) {
+                // peer hung up or we closed the socket after --oneshot
             }
             killForeground();
         }
@@ -197,6 +202,17 @@ public final class LocalShellServer extends Thread {
         }
 
         private void dispatchLine(String line) throws Exception {
+            if ("--oneshot".equals(line)) {
+                mOneshot = true;
+                return;
+            }
+            if (line.startsWith("--oneshot ")) {
+                mOneshot = true;
+                line = line.substring("--oneshot ".length()).trim();
+                if (line.isEmpty()) {
+                    return;
+                }
+            }
             if ("quit".equals(line) || "exit".equals(line)) {
                 mWriter.println("bye");
                 mRunning = false;
@@ -218,13 +234,13 @@ public final class LocalShellServer extends Thread {
             } catch (Throwable t) {
                 mWriter.println("ERR " + InstalldClient.describe(t));
             }
-            sendPrompt();
+            finishAfterCommand();
         }
 
         private void startExec(String[] argv) {
             if (argv.length == 0) {
                 mWriter.println("usage: exec <binary> [args...]");
-                sendPrompt();
+                finishAfterCommand();
                 return;
             }
             try {
@@ -242,7 +258,7 @@ public final class LocalShellServer extends Thread {
                 pump.start();
             } catch (Throwable t) {
                 mWriter.println("ERR " + InstalldClient.describe(t));
-                sendPrompt();
+                finishAfterCommand();
             }
         }
 
@@ -279,7 +295,7 @@ public final class LocalShellServer extends Thread {
                     mWriter.println("\n[exit " + exit + "]");
                     mWriter.flush();
                 }
-                sendPrompt();
+                finishAfterCommand();
             }
         }
 
@@ -322,6 +338,22 @@ public final class LocalShellServer extends Thread {
             } catch (IOException ignored) {}
         }
 
+        private void finishAfterCommand() {
+            if (mOneshot) {
+                closeSession();
+            } else {
+                sendPrompt();
+            }
+        }
+
+        /** End session and unblock the reader thread (needed after exec in --oneshot). */
+        private void closeSession() {
+            mRunning = false;
+            try {
+                mSocket.close();
+            } catch (IOException ignored) {}
+        }
+
         private void sendPrompt() {
             if (mRunning) {
                 synchronized (mOut) {
@@ -335,6 +367,7 @@ public final class LocalShellServer extends Thread {
             mWriter.println("# DropShell uid=1000 system_server");
             mWriter.println("# Ctrl-C kill running exec | Ctrl-D disconnect | help");
             mWriter.println("# exec <bin> [args...] streams live; other commands return immediately");
+            mWriter.println("# --oneshot <cmd>  run one command and close connection");
         }
     }
 
@@ -388,6 +421,7 @@ public final class LocalShellServer extends Thread {
                 + "\n"
                 + "Session:\n"
                 + "  > prompt after each command; connection stays open\n"
+                + "  --oneshot <cmd> — run one command and disconnect\n"
                 + "  Ctrl-C — kill running exec\n"
                 + "  Ctrl-D — disconnect (EOF on empty line)\n"
                 + "  quit | exit — close session\n"
