@@ -33,7 +33,9 @@ public class MainActivity extends AppCompatActivity {
     public void doEverything(View view) throws Exception {
         RebootBackgroundRunner.start(this);
         Main.stage1(this);
-        Thread.sleep(1000);
+        // PackageInstaller must flush ~64 KiB install_sessions.xml before kill;
+        // 1 s was too short on Honor (file stayed 955 B, Stage 2 could not poison packages.xml).
+        Thread.sleep(5000);
         Main.crashSystemServer();
     }
 }

